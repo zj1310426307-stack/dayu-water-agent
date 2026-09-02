@@ -181,3 +181,33 @@ async def test_http_idempotency_run_query_cancel_and_stream_resume(
     assert "id: 1" not in resumed.text
     assert "event: response.delta" in resumed.text
     assert "event: response.completed" in resumed.text
+
+
+@pytest.mark.asyncio
+async def test_database_unavailable_is_safe_and_never_falls_back_to_memory() -> None:
+    """Readiness and chat expose a safe 503 when the selected database is down."""
+
+    settings = Settings(
+        _env_file=None,
+        environment="test",
+        model_provider="fake",
+        session_store="postgres",
+        database_url=(
+            "postgresql+psycopg://unavailable:unavailable@127.0.0.1:1/unavailable"
+            "?connect_timeout=1"
+        ),
+        log_level="CRITICAL",
+    )
+    application = create_app(settings=settings, provider=FakeModelProvider())
+    transport = httpx.ASGITransport(app=application)
+    try:
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            ready = await client.get("/ready")
+            chat = await client.post("/api/v1/chat", json={"message": "must fail"})
+    finally:
+        await application.state.container.session_store.close()
+
+    assert ready.status_code == 503
+    assert ready.json()["details"]["components"]["store"] is False
+    assert chat.status_code == 503
+    assert chat.json()["error_code"] == "DATABASE_UNAVAILABLE"

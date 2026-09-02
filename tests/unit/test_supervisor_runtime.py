@@ -207,3 +207,83 @@ async def test_stream_never_retries_after_first_persisted_delta() -> None:
         StreamEventType.RUN_FAILED,
     ]
     assert (await store.get_run(run.id)).attempt_count == 1
+
+
+@pytest.mark.asyncio
+async def test_cancel_during_retry_backoff_stops_next_attempt() -> None:
+    """Cancellation interrupts a pending backoff before another provider call."""
+
+    provider = FakeModelProvider(fail_times=5, failure_retryable=True)
+    store = InMemorySessionStore()
+    registry = ToolRegistry()
+    register_builtin_tools(registry)
+    supervisor = SupervisorAgent(
+        provider=provider,
+        session_store=store,
+        tool_registry=registry,
+        retry_budget=RetryBudget(
+            max_attempts=3,
+            max_elapsed_seconds=5,
+            base_delay=2,
+            max_delay=2,
+            jitter=False,
+        ),
+        worker_instance_id="test-worker",
+    )
+    run = await supervisor.start_stream("cancel backoff")
+    await _yield_until(lambda: provider.call_count == 1)
+    await supervisor.cancel(run.id)
+
+    assert provider.call_count == 1
+    assert (await store.get_run(run.id)).status is RunStatus.CANCELLED
+
+
+@pytest.mark.asyncio
+async def test_completion_cancel_race_has_one_terminal_state_and_event() -> None:
+    """Database arbitration prevents completed-to-cancelled or duplicate terminals."""
+
+    release = asyncio.Event()
+    supervisor, store = _supervisor(FakeModelProvider(block_event=release))
+    run = await supervisor.start_stream("race")
+    await _yield_until(lambda: supervisor.metrics.snapshot().provider_attempts_total == 1)
+    release.set()
+    await asyncio.gather(supervisor.cancel(run.id), return_exceptions=True)
+    events = await store.list_stream_events(run.id)
+    terminal = [
+        event
+        for event in events
+        if event.type
+        in {
+            StreamEventType.RESPONSE_COMPLETED,
+            StreamEventType.RUN_CANCELLED,
+            StreamEventType.RUN_FAILED,
+            StreamEventType.RUN_INTERRUPTED,
+        }
+    ]
+
+    assert len(terminal) == 1
+    assert (await store.get_run(run.id)).status in {
+        RunStatus.COMPLETED,
+        RunStatus.CANCELLED,
+    }
+
+
+@pytest.mark.asyncio
+async def test_run_logs_include_all_correlation_identifiers(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A complete run can be traced by request, run, session, and trace IDs."""
+
+    caplog.set_level("INFO")
+    supervisor, _ = _supervisor(FakeModelProvider())
+    result = await supervisor.run("correlate", request_id="request-correlation")
+    records = [
+        record for record in caplog.records if record.getMessage() == "Agent trace started"
+    ]
+
+    assert len(records) == 1
+    record = records[0]
+    assert record.request_id == "request-correlation"  # type: ignore[attr-defined]
+    assert record.run_id == result.run_id  # type: ignore[attr-defined]
+    assert record.session_id == result.session_id  # type: ignore[attr-defined]
+    assert record.trace_id == result.trace_id  # type: ignore[attr-defined]

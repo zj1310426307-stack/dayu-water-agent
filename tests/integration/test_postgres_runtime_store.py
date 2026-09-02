@@ -9,6 +9,7 @@ import httpx
 import pytest
 import pytest_asyncio
 
+from dayu_agent.agents import SupervisorAgent
 from dayu_agent.api.app import create_app
 from dayu_agent.config import Settings
 from dayu_agent.database.store import SQLAlchemyRuntimeStore
@@ -16,6 +17,8 @@ from dayu_agent.exceptions import IdempotencyConflictError, SessionBusyError
 from dayu_agent.providers.fake import FakeModelProvider
 from dayu_agent.runtime.result import AgentResult, AgentStatus
 from dayu_agent.runtime.state import RunReservation, RunStatus, StreamEventType
+from dayu_agent.tools.builtin import register_builtin_tools
+from dayu_agent.tools.registry import ToolRegistry
 
 pytestmark = pytest.mark.integration
 
@@ -261,3 +264,39 @@ async def test_postgres_api_handles_fifty_parallel_independent_sessions() -> Non
     assert all(response.status_code == 200 for response in responses)
     assert provider.call_count == 50
     assert len({response.json()["run_id"] for response in responses}) == 50
+
+
+async def test_postgres_startup_reconciles_old_active_run_as_interrupted(
+    postgres_store: SQLAlchemyRuntimeStore,
+) -> None:
+    """A new worker never auto-replays an ambiguous prior provider execution."""
+
+    session = await postgres_store.create_session()
+    reservation = await postgres_store.reserve_run(
+        session_id=session.id,
+        session_metadata={},
+        user_id=None,
+        idempotency_key=f"orphan-{uuid4()}",
+        request_hash="orphan-hash",
+        request_id=str(uuid4()),
+        trace_id=str(uuid4()),
+        provider="fake",
+        model="fake-model",
+        worker_instance_id="old-worker",
+        run_metadata={},
+    )
+    await postgres_store.mark_run_running(reservation.run.id, "old-worker")
+    registry = ToolRegistry()
+    register_builtin_tools(registry)
+    supervisor = SupervisorAgent(
+        provider=FakeModelProvider(),
+        session_store=postgres_store,
+        tool_registry=registry,
+        worker_instance_id="new-worker",
+    )
+
+    assert await supervisor.initialize() == 1
+    reconciled = await postgres_store.get_run(reservation.run.id)
+    events = await postgres_store.list_stream_events(reservation.run.id)
+    assert reconciled.status is RunStatus.INTERRUPTED
+    assert events[-1].type is StreamEventType.RUN_INTERRUPTED
