@@ -5,25 +5,35 @@ import os
 from collections.abc import AsyncIterator
 from uuid import uuid4
 
+import httpx
 import pytest
 import pytest_asyncio
 
+from dayu_agent.api.app import create_app
+from dayu_agent.config import Settings
 from dayu_agent.database.store import SQLAlchemyRuntimeStore
 from dayu_agent.exceptions import IdempotencyConflictError, SessionBusyError
+from dayu_agent.providers.fake import FakeModelProvider
 from dayu_agent.runtime.result import AgentResult, AgentStatus
 from dayu_agent.runtime.state import RunReservation, RunStatus, StreamEventType
 
 pytestmark = pytest.mark.integration
 
 
-@pytest_asyncio.fixture
-async def postgres_store() -> AsyncIterator[SQLAlchemyRuntimeStore]:
-    """Yield a store only when an explicit disposable test database is configured."""
+def _database_url() -> str:
+    """Return the explicit test database URL or skip the live suite."""
 
     database_url = os.getenv("DAYU_TEST_DATABASE_URL")
     if not database_url:
         pytest.skip("DAYU_TEST_DATABASE_URL is not configured")
-    store = SQLAlchemyRuntimeStore(database_url)
+    return database_url
+
+
+@pytest_asyncio.fixture
+async def postgres_store() -> AsyncIterator[SQLAlchemyRuntimeStore]:
+    """Yield a store only when an explicit disposable test database is configured."""
+
+    store = SQLAlchemyRuntimeStore(_database_url())
     await store.initialize()
     try:
         yield store
@@ -173,3 +183,81 @@ async def test_postgres_failure_does_not_pollute_committed_history(
 
     assert failed.status is RunStatus.FAILED
     assert await postgres_store.list_messages(session.id) == ()
+
+
+def _postgres_settings() -> Settings:
+    """Build production-like test settings without relying on ambient configuration."""
+
+    return Settings(
+        _env_file=None,
+        environment="test",
+        model_provider="fake",
+        model_name="fake-postgres",
+        session_store="postgres",
+        database_url=_database_url(),
+        log_level="CRITICAL",
+        retry_jitter=False,
+    )
+
+
+async def test_postgres_api_persists_sessions_and_runs_across_restart() -> None:
+    """A new application instance can query the prior committed session and run."""
+
+    first_app = create_app(
+        settings=_postgres_settings(),
+        provider=FakeModelProvider(model_name="fake-postgres"),
+    )
+    async with first_app.router.lifespan_context(first_app):
+        transport = httpx.ASGITransport(app=first_app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            created = await client.post("/api/v1/sessions", json={})
+            session_id = created.json()["session_id"]
+            chat = await client.post(
+                "/api/v1/chat",
+                json={"message": "persist", "session_id": session_id},
+                headers={"Idempotency-Key": f"restart-{uuid4()}"},
+            )
+            run_id = chat.json()["run_id"]
+
+    second_app = create_app(
+        settings=_postgres_settings(),
+        provider=FakeModelProvider(model_name="fake-postgres"),
+    )
+    async with second_app.router.lifespan_context(second_app):
+        transport = httpx.ASGITransport(app=second_app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            session = await client.get(f"/api/v1/sessions/{session_id}")
+            run = await client.get(f"/api/v1/runs/{run_id}")
+
+    assert [item["content"] for item in session.json()["messages"]] == [
+        "persist",
+        "Fake response (turn 1): persist",
+    ]
+    assert run.json()["status"] == "completed"
+
+
+async def test_postgres_api_handles_fifty_parallel_independent_sessions() -> None:
+    """Fifty independent requests complete without global serialization or disorder."""
+
+    provider = FakeModelProvider(model_name="fake-postgres", delay_seconds=0.01)
+    application = create_app(settings=_postgres_settings(), provider=provider)
+    async with application.router.lifespan_context(application):
+        transport = httpx.ASGITransport(app=application)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            created = await asyncio.gather(
+                *(client.post("/api/v1/sessions", json={}) for _ in range(50))
+            )
+            session_ids = [response.json()["session_id"] for response in created]
+            responses = await asyncio.gather(
+                *(
+                    client.post(
+                        "/api/v1/chat",
+                        json={"message": f"message-{index}", "session_id": session_id},
+                    )
+                    for index, session_id in enumerate(session_ids)
+                )
+            )
+
+    assert all(response.status_code == 200 for response in responses)
+    assert provider.call_count == 50
+    assert len({response.json()["run_id"] for response in responses}) == 50

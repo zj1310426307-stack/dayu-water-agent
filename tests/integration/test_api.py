@@ -23,6 +23,7 @@ async def test_health_and_ready_have_distinct_semantics(api_client: httpx.AsyncC
         "provider": "fake",
         "model": "fake-test",
         "detail": "deterministic provider ready",
+        "components": {"runtime": True, "store": True, "provider": True},
     }
     assert health.headers["x-request-id"]
 
@@ -76,8 +77,10 @@ async def test_tool_command_and_sse_stream(api_client: httpx.AsyncClient) -> Non
     stream = await api_client.post("/api/v1/chat/stream", json={"message": "stream"})
     assert stream.status_code == 200
     assert stream.headers["content-type"].startswith("text/event-stream")
-    assert "event: delta" in stream.text
-    assert "event: done" in stream.text
+    assert "event: response.delta" in stream.text
+    assert "event: response.completed" in stream.text
+    assert "id: 1" in stream.text
+    assert stream.headers["x-run-id"]
     assert "Fake response (turn 1): stream" in stream.text
 
 
@@ -126,7 +129,7 @@ async def test_provider_error_maps_to_502_without_raw_exception() -> None:
 
 @pytest.mark.asyncio
 async def test_openapi_contains_required_phase_zero_routes(api_client: httpx.AsyncClient) -> None:
-    """The generated contract must expose every required Phase-00 endpoint."""
+    """The generated contract must expose every required Phase-01 endpoint."""
 
     schema = (await api_client.get("/openapi.json")).json()
     assert {
@@ -136,4 +139,45 @@ async def test_openapi_contains_required_phase_zero_routes(api_client: httpx.Asy
         "/api/v1/chat/stream",
         "/api/v1/sessions",
         "/api/v1/sessions/{session_id}",
+        "/api/v1/runs/{run_id}",
+        "/api/v1/runs/{run_id}/cancel",
+        "/api/v1/runs/{run_id}/stream",
     }.issubset(schema["paths"])
+
+
+@pytest.mark.asyncio
+async def test_http_idempotency_run_query_cancel_and_stream_resume(
+    api_client: httpx.AsyncClient,
+    fake_provider: FakeModelProvider,
+) -> None:
+    """Public runtime controls preserve one execution and resumable event identity."""
+
+    headers = {"Idempotency-Key": "api-stable-key"}
+    first = await api_client.post("/api/v1/chat", json={"message": "once"}, headers=headers)
+    second = await api_client.post("/api/v1/chat", json={"message": "once"}, headers=headers)
+    conflict = await api_client.post(
+        "/api/v1/chat", json={"message": "changed"}, headers=headers
+    )
+    run_id = first.json()["run_id"]
+    queried = await api_client.get(f"/api/v1/runs/{run_id}")
+    cancelled = await api_client.post(f"/api/v1/runs/{run_id}/cancel")
+
+    assert first.json() == second.json()
+    assert fake_provider.call_count == 1
+    assert conflict.status_code == 409
+    assert conflict.json()["error_code"] == "IDEMPOTENCY_CONFLICT"
+    assert queried.json()["status"] == "completed"
+    assert cancelled.json()["disposition"] == "already_terminal"
+
+    streamed = await api_client.post(
+        "/api/v1/chat/stream",
+        json={"message": "resume"},
+        headers={"Idempotency-Key": "api-stream-key"},
+    )
+    stream_run_id = streamed.headers["x-run-id"]
+    resumed = await api_client.get(
+        f"/api/v1/runs/{stream_run_id}/stream", headers={"Last-Event-ID": "1"}
+    )
+    assert "id: 1" not in resumed.text
+    assert "event: response.delta" in resumed.text
+    assert "event: response.completed" in resumed.text

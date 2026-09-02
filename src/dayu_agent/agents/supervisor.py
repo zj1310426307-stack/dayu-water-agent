@@ -33,7 +33,7 @@ from dayu_agent.guardrails import (
     PhaseZeroToolGuardrail,
     ToolGuardrail,
 )
-from dayu_agent.observability import TraceContext
+from dayu_agent.observability import RuntimeMetrics, TraceContext, telemetry_span
 from dayu_agent.providers.base import (
     MessageRole,
     ModelProvider,
@@ -80,6 +80,7 @@ class SupervisorAgent:
         session_store: RuntimeStore,
         tool_registry: ToolRegistry,
         retry_budget: RetryBudget | None = None,
+        metrics: RuntimeMetrics | None = None,
         worker_instance_id: str | None = None,
         input_guardrails: tuple[InputGuardrail, ...] | None = None,
         output_guardrails: tuple[OutputGuardrail, ...] | None = None,
@@ -91,6 +92,7 @@ class SupervisorAgent:
         self.session_store = session_store
         self.tool_registry = tool_registry
         self.retry_budget = retry_budget or RetryBudget()
+        self.metrics = metrics or RuntimeMetrics()
         self.worker_instance_id = worker_instance_id or str(uuid4())
         self.input_guardrails = input_guardrails or (NonEmptyInputGuardrail(),)
         self.output_guardrails = output_guardrails or (NonEmptyOutputGuardrail(),)
@@ -176,7 +178,13 @@ class SupervisorAgent:
     ) -> ProviderRequest:
         """Translate committed history plus the uncommitted current input."""
 
-        history = await self.session_store.list_messages(context.session_id)
+        with telemetry_span(
+            "session.load",
+            request_id=context.request_id,
+            run_id=context.run_id,
+            session_id=context.session_id,
+        ):
+            history = await self.session_store.list_messages(context.session_id)
         messages = [
             ProviderMessage(
                 role=(
@@ -337,6 +345,7 @@ class SupervisorAgent:
         )
         run = reservation.run
         if reservation.owns_execution:
+            self.metrics.run_started()
             context = provisional.model_copy(
                 update={"session_id": run.session_id, "run_id": run.id}
             )
@@ -401,6 +410,7 @@ class SupervisorAgent:
     ) -> AgentResult:
         """Own all provider, retry, terminal-state, and success-commit work."""
 
+        started = monotonic()
         try:
             await self.session_store.mark_run_running(run.id, self.worker_instance_id)
             with TraceContext(
@@ -414,34 +424,68 @@ class SupervisorAgent:
                     result = await self._run_tool(*tool_command, context)
                 else:
                     request = await self._provider_request(context, user_content)
-                    response = await self._run_provider_with_retry(
-                        run.id, request, streaming=streaming
-                    )
+                    with telemetry_span(
+                        "provider.run",
+                        request_id=context.request_id,
+                        run_id=run.id,
+                        session_id=context.session_id,
+                        provider=self.provider.name,
+                        model=self.provider.model_name,
+                    ):
+                        response = await self._run_provider_with_retry(
+                            run.id, request, streaming=streaming
+                        )
                     await self._check_output(response.content, context)
                     result = self._result_from_provider(context, response)
-                await self.session_store.commit_run_success(
-                    run.id,
-                    user_content=user_content,
-                    user_metadata=user_metadata,
-                    assistant_content=result.content,
-                    assistant_metadata={
-                        "provider": self.provider.name,
-                        "model": self.provider.model_name,
-                    },
-                    result=result,
+                with telemetry_span(
+                    "session.commit",
+                    request_id=context.request_id,
+                    run_id=run.id,
+                    session_id=context.session_id,
+                ):
+                    await self.session_store.commit_run_success(
+                        run.id,
+                        user_content=user_content,
+                        user_metadata=user_metadata,
+                        assistant_content=result.content,
+                        assistant_metadata={
+                            "provider": self.provider.name,
+                            "model": self.provider.model_name,
+                        },
+                        result=result,
+                    )
+                self.metrics.run_finished(
+                    duration_seconds=monotonic() - started,
+                    failed=False,
+                    cancelled=False,
                 )
                 return result
         except asyncio.CancelledError:
             await self._ensure_cancelled_if_active(run.id)
+            self.metrics.run_finished(
+                duration_seconds=monotonic() - started,
+                failed=False,
+                cancelled=True,
+            )
             raise
         except DayuAgentError as exc:
             await self.session_store.fail_run(run.id, error_code=exc.error_code)
+            self.metrics.run_finished(
+                duration_seconds=monotonic() - started,
+                failed=True,
+                cancelled=False,
+            )
             raise
         except Exception as exc:
             wrapped = ProviderError(
                 details={"provider": self.provider.name, "model": self.provider.model_name}
             )
             await self.session_store.fail_run(run.id, error_code=wrapped.error_code)
+            self.metrics.run_finished(
+                duration_seconds=monotonic() - started,
+                failed=True,
+                cancelled=False,
+            )
             raise wrapped from exc
 
     async def _ensure_cancelled_if_active(self, run_id: str) -> None:
@@ -469,6 +513,21 @@ class SupervisorAgent:
         started = monotonic()
         while True:
             durable = await self.session_store.increment_run_attempt(run_id)
+            self.metrics.provider_attempt()
+            logger.info(
+                "Provider attempt started",
+                extra={
+                    "request_id": request.context.request_id,
+                    "run_id": run_id,
+                    "trace_id": request.context.trace_id,
+                    "session_id": request.context.session_id,
+                    "agent_name": self.name,
+                    "provider": self.provider.name,
+                    "model": self.provider.model_name,
+                    "status": "started",
+                    "attempt": durable.attempt_count,
+                },
+            )
             emitted_delta = False
             try:
                 remaining = self.retry_budget.max_elapsed_seconds - (monotonic() - started)
@@ -476,25 +535,37 @@ class SupervisorAgent:
                     raise RetryBudgetExhaustedError(
                         details={"attempt_count": durable.attempt_count}
                     )
-                async with asyncio.timeout(remaining):
-                    if not streaming:
-                        return await self.provider.run(request)
-                    final_response: ProviderResponse | None = None
-                    async for event in self.provider.stream(request):
-                        if event.delta is not None:
-                            emitted_delta = True
-                            await self.session_store.append_stream_event(
-                                run_id,
-                                StreamEventType.RESPONSE_DELTA,
-                                {"delta": event.delta},
+                with telemetry_span(
+                    "provider.attempt",
+                    request_id=request.context.request_id,
+                    run_id=run_id,
+                    session_id=request.context.session_id,
+                    attempt=durable.attempt_count,
+                ):
+                    async with asyncio.timeout(remaining):
+                        if not streaming:
+                            return await self.provider.run(request)
+                        final_response: ProviderResponse | None = None
+                        async for event in self.provider.stream(request):
+                            if event.delta is not None:
+                                emitted_delta = True
+                                with telemetry_span(
+                                    "stream.persist",
+                                    run_id=run_id,
+                                    sequence_type=StreamEventType.RESPONSE_DELTA.value,
+                                ):
+                                    await self.session_store.append_stream_event(
+                                        run_id,
+                                        StreamEventType.RESPONSE_DELTA,
+                                        {"delta": event.delta},
+                                    )
+                            if event.done:
+                                final_response = event.response
+                        if final_response is None:
+                            raise ProviderError(
+                                "The provider stream ended without a final response."
                             )
-                        if event.done:
-                            final_response = event.response
-                    if final_response is None:
-                        raise ProviderError(
-                            "The provider stream ended without a final response."
-                        )
-                    return final_response
+                        return final_response
             except TimeoutError as exc:
                 error: ProviderError = ProviderTimeoutError(
                     details={"provider": self.provider.name, "model": self.provider.model_name}
@@ -530,11 +601,15 @@ class SupervisorAgent:
                     "agent_name": self.name,
                     "provider": self.provider.name,
                     "model": self.provider.model_name,
+                    "status": "retrying",
                     "attempt": durable.attempt_count,
-                    "retry_delay": round(delay, 3),
-                    "error": error.error_code,
+                    "backoff": round(delay, 3),
+                    "elapsed": round(elapsed, 3),
+                    "retryable": error.retryable,
+                    "error_class": type(error).__name__,
                 },
             )
+            self.metrics.provider_retry()
             await asyncio.sleep(delay)
 
     def _result_from_provider(
@@ -588,6 +663,8 @@ class SupervisorAgent:
         """Replay then tail durable events until exactly one terminal event."""
 
         await self.session_store.get_run(run_id)
+        if after_sequence > 0:
+            self.metrics.stream_resume()
         cursor = after_sequence
         while True:
             events = await self.session_store.list_stream_events(

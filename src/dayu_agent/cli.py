@@ -27,13 +27,30 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 async def _health_command() -> int:
-    """Check configuration-level readiness without making a model request."""
+    """Check runtime, storage, and provider readiness without a model request."""
 
     settings = get_settings()
     container = build_container(settings)
-    health = await container.provider.health()
-    sys.stdout.write(health.model_dump_json() + "\n")
-    return 0 if health.ready else 1
+    try:
+        await container.supervisor.initialize()
+        provider_health = await container.provider.health()
+        store_ready = await container.session_store.ping()
+        ready = provider_health.ready and store_ready and container.supervisor.accepting
+        payload = {
+            "ready": ready,
+            "checks": {
+                "runtime": container.supervisor.accepting,
+                "store": store_ready,
+                "provider": provider_health.ready,
+            },
+            "provider": provider_health.provider,
+            "model": provider_health.model,
+        }
+        sys.stdout.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        return 0 if ready else 1
+    finally:
+        await container.supervisor.shutdown()
+        await container.session_store.close()
 
 
 async def _single_chat(message: str, session_id: str | None) -> int:
@@ -41,9 +58,14 @@ async def _single_chat(message: str, session_id: str | None) -> int:
 
     settings = get_settings()
     container = build_container(settings)
-    result = await container.supervisor.run(message, session_id=session_id)
-    sys.stdout.write(result.model_dump_json() + "\n")
-    return 0
+    try:
+        await container.supervisor.initialize()
+        result = await container.supervisor.run(message, session_id=session_id)
+        sys.stdout.write(result.model_dump_json() + "\n")
+        return 0
+    finally:
+        await container.supervisor.shutdown()
+        await container.session_store.close()
 
 
 async def _interactive_chat(session_id: str | None) -> int:
@@ -51,23 +73,28 @@ async def _interactive_chat(session_id: str | None) -> int:
 
     settings = get_settings()
     container = build_container(settings)
-    active_session = session_id
-    if active_session is None:
-        active_session = (await container.supervisor.create_session()).id
+    try:
+        await container.supervisor.initialize()
+        active_session = session_id
+        if active_session is None:
+            active_session = (await container.supervisor.create_session()).id
 
-    sys.stdout.write("Dayu Water Agent\nType 'exit' or 'quit' to stop.\n\n")
-    while True:
-        try:
-            message = (await asyncio.to_thread(input, "> ")).strip()
-        except EOFError:
-            sys.stdout.write("\n")
-            return 0
-        if message.lower() in {"exit", "quit"}:
-            return 0
-        if not message:
-            continue
-        result = await container.supervisor.run(message, session_id=active_session)
-        sys.stdout.write(result.content + "\n")
+        sys.stdout.write("Dayu Water Agent\nType 'exit' or 'quit' to stop.\n\n")
+        while True:
+            try:
+                message = (await asyncio.to_thread(input, "> ")).strip()
+            except EOFError:
+                sys.stdout.write("\n")
+                return 0
+            if message.lower() in {"exit", "quit"}:
+                return 0
+            if not message:
+                continue
+            result = await container.supervisor.run(message, session_id=active_session)
+            sys.stdout.write(result.content + "\n")
+    finally:
+        await container.supervisor.shutdown()
+        await container.session_store.close()
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -77,6 +104,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         settings = get_settings()
         configure_logging(settings.log_level)
+        if sys.platform == "win32" and settings.session_store == "postgres":
+            asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
         if args.command == "version":
             sys.stdout.write(f"dayu-water-agent {__version__}\n")
             return 0

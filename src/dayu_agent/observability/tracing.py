@@ -1,9 +1,12 @@
 """Local trace abstraction that does not require a SaaS backend."""
 
 import logging
+from contextlib import AbstractContextManager
 from time import perf_counter
+from types import TracebackType
 from typing import Any
 
+from dayu_agent.observability.telemetry import telemetry_span
 from dayu_agent.runtime.context import AgentContext
 
 logger = logging.getLogger(__name__)
@@ -19,11 +22,23 @@ class TraceContext:
         self.attributes: dict[str, Any] = {}
         self.duration_ms: float | None = None
         self._started: float | None = None
+        self._otel_context: AbstractContextManager[None] | None = None
 
     def __enter__(self) -> "TraceContext":
         """Start timing and emit a structured trace-start event."""
 
         self._started = perf_counter()
+        self._otel_context = telemetry_span(
+            "agent.run",
+            request_id=self.context.request_id,
+            run_id=self.context.run_id,
+            trace_id=self.context.trace_id,
+            session_id=self.context.session_id,
+            agent_name=self.context.agent_name,
+            provider=self.provider,
+            model=self.model,
+        )
+        self._otel_context.__enter__()
         logger.info("Agent trace started", extra=self._log_fields())
         return self
 
@@ -31,20 +46,21 @@ class TraceContext:
         self,
         exc_type: type[BaseException] | None,
         exc_value: BaseException | None,
-        traceback: object | None,
+        traceback: TracebackType | None,
     ) -> None:
         """Finish timing and emit safe completion or failure metadata."""
 
-        del traceback
         if self._started is not None:
             self.duration_ms = (perf_counter() - self._started) * 1000
         fields = self._log_fields()
-        fields["duration"] = round(self.duration_ms or 0, 3)
+        fields["duration_ms"] = round(self.duration_ms or 0, 3)
         if exc_type is not None:
             fields["error"] = exc_type.__name__
             logger.error("Agent trace failed", extra=fields)
-            return
-        logger.info("Agent trace completed", extra=fields)
+        else:
+            logger.info("Agent trace completed", extra=fields)
+        if self._otel_context is not None:
+            self._otel_context.__exit__(exc_type, exc_value, traceback)
 
     def annotate(self, **attributes: Any) -> None:
         """Attach additional non-secret values to subsequent trace logs."""

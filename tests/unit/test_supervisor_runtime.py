@@ -141,6 +141,11 @@ async def test_retry_budget_counts_attempts_and_recovers_transient_failures() ->
     assert provider.call_count == 3
     assert run.attempt_count == 3
     assert run.status is RunStatus.COMPLETED
+    metrics = supervisor.metrics.snapshot()
+    assert metrics.agent_runs_total == 1
+    assert metrics.provider_attempts_total == 3
+    assert metrics.provider_retries_total == 2
+    assert metrics.active_runs == 0
 
 
 @pytest.mark.asyncio
@@ -180,6 +185,7 @@ async def test_stream_resume_replays_only_events_after_cursor() -> None:
     assert sequences == sorted(set(sequences))
     assert resumed[0].sequence > cursor
     assert resumed[-1].type is StreamEventType.RESPONSE_COMPLETED
+    assert supervisor.metrics.snapshot().stream_resume_total == 1
 
 
 @pytest.mark.asyncio
