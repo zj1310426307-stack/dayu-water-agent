@@ -1,5 +1,7 @@
 """Shared deterministic fixtures for unit and API tests."""
 
+import asyncio
+import sys
 from collections.abc import AsyncIterator
 
 import httpx
@@ -9,6 +11,9 @@ import pytest_asyncio
 from dayu_agent.api.app import create_app
 from dayu_agent.config import Settings, get_settings
 from dayu_agent.providers.fake import FakeModelProvider
+
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 
 @pytest.fixture(autouse=True)
