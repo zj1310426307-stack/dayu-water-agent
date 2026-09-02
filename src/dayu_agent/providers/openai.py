@@ -6,8 +6,20 @@ from collections.abc import AsyncIterator
 from typing import Any, cast
 
 from agents import Agent, OpenAIProvider, RunConfig, Runner
+from openai import (
+    APIConnectionError,
+    APIStatusError,
+    APITimeoutError,
+    AsyncOpenAI,
+    InternalServerError,
+    RateLimitError,
+)
 
-from dayu_agent.exceptions import ProviderError
+from dayu_agent.exceptions import (
+    ProviderError,
+    ProviderTimeoutError,
+    ProviderUnavailableError,
+)
 from dayu_agent.providers.base import (
     ModelProvider,
     ProviderHealth,
@@ -37,9 +49,19 @@ class OpenAIModelProvider(ModelProvider):
         timeout_seconds: float,
         sdk_tracing_enabled: bool,
     ) -> None:
+        """Build a zero-retry SDK client so the Runtime owns the only retry budget."""
+
         self._model_name = model_name
         self._timeout_seconds = timeout_seconds
-        self._sdk_provider = OpenAIProvider(api_key=api_key, use_responses=True)
+        self._client = AsyncOpenAI(
+            api_key=api_key,
+            max_retries=0,
+            timeout=timeout_seconds,
+        )
+        self._sdk_provider = OpenAIProvider(
+            openai_client=self._client,
+            use_responses=True,
+        )
         self._run_config = RunConfig(
             model_provider=self._sdk_provider,
             tracing_disabled=not sdk_tracing_enabled,
@@ -102,6 +124,23 @@ class OpenAIModelProvider(ModelProvider):
             tool_calls=tool_calls,
         )
 
+    def _normalize_failure(self, exc: Exception) -> ProviderError:
+        """Map SDK failures to stable retryable or terminal provider errors."""
+
+        details = {"provider": self.name, "model": self.model_name}
+        if isinstance(exc, (TimeoutError, APITimeoutError)):
+            return ProviderTimeoutError(details=details)
+        if isinstance(
+            exc,
+            (APIConnectionError, RateLimitError, InternalServerError),
+        ):
+            return ProviderUnavailableError(details=details)
+        if isinstance(exc, APIStatusError) and (
+            exc.status_code >= 500 or exc.status_code in {408, 409, 429}
+        ):
+            return ProviderUnavailableError(details=details)
+        return ProviderError(details=details)
+
     async def run(self, request: ProviderRequest) -> ProviderResponse:
         """Execute a complete SDK run with a provider-owned timeout and client."""
 
@@ -116,6 +155,8 @@ class OpenAIModelProvider(ModelProvider):
             if not response.content.strip():
                 raise ProviderError("The model provider returned empty content.")
             return response
+        except asyncio.CancelledError:
+            raise
         except ProviderError:
             raise
         except Exception as exc:
@@ -128,9 +169,7 @@ class OpenAIModelProvider(ModelProvider):
                     "error": type(exc).__name__,
                 },
             )
-            raise ProviderError(
-                details={"provider": self.name, "model": self.model_name}
-            ) from exc
+            raise self._normalize_failure(exc) from exc
 
     async def stream(self, request: ProviderRequest) -> AsyncIterator[ProviderStreamEvent]:
         """Forward native Agents SDK text deltas and emit one normalized final event."""
@@ -156,6 +195,8 @@ class OpenAIModelProvider(ModelProvider):
                 if not response.content.strip():
                     raise ProviderError("The model provider returned empty content.")
                 yield ProviderStreamEvent(response=response, done=True)
+        except asyncio.CancelledError:
+            raise
         except ProviderError:
             raise
         except Exception as exc:
@@ -168,6 +209,4 @@ class OpenAIModelProvider(ModelProvider):
                     "error": type(exc).__name__,
                 },
             )
-            raise ProviderError(
-                details={"provider": self.name, "model": self.model_name}
-            ) from exc
+            raise self._normalize_failure(exc) from exc

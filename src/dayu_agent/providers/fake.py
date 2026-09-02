@@ -1,8 +1,9 @@
 """Deterministic provider used by tests, CI, and credential-free development."""
 
+import asyncio
 from collections.abc import AsyncIterator
 
-from dayu_agent.exceptions import ProviderError
+from dayu_agent.exceptions import ProviderError, ProviderUnavailableError
 from dayu_agent.providers.base import (
     MessageRole,
     ModelProvider,
@@ -17,9 +18,28 @@ from dayu_agent.runtime.result import TokenUsage
 class FakeModelProvider(ModelProvider):
     """Return deterministic text without network access or token charges."""
 
-    def __init__(self, *, model_name: str = "fake-deterministic", fail: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        model_name: str = "fake-deterministic",
+        fail: bool = False,
+        fail_times: int = 0,
+        failure_retryable: bool = False,
+        delay_seconds: float = 0,
+        stream_chunks: tuple[str, ...] | None = None,
+        stream_fail_after_deltas: int | None = None,
+        block_event: asyncio.Event | None = None,
+    ) -> None:
+        """Configure deterministic delays, failures, chunks, and cancellation points."""
+
         self._model_name = model_name
         self._fail = fail
+        self._fail_times = fail_times
+        self._failure_retryable = failure_retryable
+        self._delay_seconds = delay_seconds
+        self._stream_chunks = stream_chunks
+        self._stream_fail_after_deltas = stream_fail_after_deltas
+        self._block_event = block_event
         self.call_count = 0
 
     @property
@@ -48,8 +68,30 @@ class FakeModelProvider(ModelProvider):
         """Build a stable response from the latest user message and turn number."""
 
         self.call_count += 1
-        if self._fail:
-            raise ProviderError(details={"provider": self.name, "model": self.model_name})
+        await self._wait()
+        self._raise_scripted_failure()
+        return self._response(request)
+
+    async def _wait(self) -> None:
+        """Apply cancellable scripted latency and optional external blocking."""
+
+        if self._delay_seconds:
+            await asyncio.sleep(self._delay_seconds)
+        if self._block_event is not None:
+            await self._block_event.wait()
+
+    def _raise_scripted_failure(self) -> None:
+        """Raise the configured stable failure for the current call number."""
+
+        if not self._fail and self.call_count > self._fail_times:
+            return
+        details = {"provider": self.name, "model": self.model_name}
+        if self._failure_retryable:
+            raise ProviderUnavailableError(details=details)
+        raise ProviderError(details=details)
+
+    def _response(self, request: ProviderRequest) -> ProviderResponse:
+        """Construct one deterministic normalized response without side effects."""
 
         user_messages = [item.content for item in request.messages if item.role is MessageRole.USER]
         latest_message = user_messages[-1]
@@ -66,8 +108,18 @@ class FakeModelProvider(ModelProvider):
         )
 
     async def stream(self, request: ProviderRequest) -> AsyncIterator[ProviderStreamEvent]:
-        """Yield the deterministic provider result as one native logical delta."""
+        """Yield scripted chunks and optionally fail after output has started."""
 
-        response = await self.run(request)
-        yield ProviderStreamEvent(delta=response.content)
+        self.call_count += 1
+        await self._wait()
+        self._raise_scripted_failure()
+        response = self._response(request)
+        chunks = self._stream_chunks or (response.content,)
+        for index, chunk in enumerate(chunks, start=1):
+            yield ProviderStreamEvent(delta=chunk)
+            if self._stream_fail_after_deltas == index:
+                details = {"provider": self.name, "model": self.model_name}
+                if self._failure_retryable:
+                    raise ProviderUnavailableError(details=details)
+                raise ProviderError(details=details)
         yield ProviderStreamEvent(response=response, done=True)

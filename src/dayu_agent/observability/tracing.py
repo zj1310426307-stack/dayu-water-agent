@@ -56,6 +56,8 @@ class TraceContext:
 
         return {
             "request_id": self.context.request_id,
+            "run_id": self.context.run_id,
+            "trace_id": self.context.trace_id,
             "session_id": self.context.session_id,
             "agent_name": self.context.agent_name,
             "provider": self.provider,
