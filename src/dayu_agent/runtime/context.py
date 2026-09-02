@@ -19,6 +19,8 @@ class AgentContext(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     request_id: str = Field(default_factory=lambda: str(uuid4()), min_length=1)
+    run_id: str | None = None
+    trace_id: str = Field(default_factory=lambda: str(uuid4()), min_length=1)
     session_id: str
     user_id: str | None = None
     agent_name: str = "SupervisorAgent"
