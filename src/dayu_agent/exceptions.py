@@ -222,6 +222,14 @@ class CancellationUnavailableError(RunError):
     default_message = "This process does not own the active provider task."
 
 
+class RuntimeUnavailableError(RunError):
+    """Raised when shutdown admission control rejects new execution ownership."""
+
+    error_code = "RUNTIME_UNAVAILABLE"
+    http_status = 503
+    default_message = "The agent runtime is not accepting new runs."
+
+
 class DatabaseUnavailableError(DayuAgentError):
     """Raised when the selected persistent store cannot safely serve requests."""
 

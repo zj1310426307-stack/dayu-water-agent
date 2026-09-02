@@ -5,6 +5,7 @@ import hashlib
 import json
 import logging
 from collections.abc import AsyncIterator
+from datetime import UTC, datetime, timedelta
 from functools import partial
 from time import monotonic
 from typing import Any
@@ -23,6 +24,7 @@ from dayu_agent.exceptions import (
     RunCancelledError,
     RunError,
     RunInterruptedError,
+    RuntimeUnavailableError,
     ToolValidationError,
 )
 from dayu_agent.guardrails import (
@@ -81,6 +83,7 @@ class SupervisorAgent:
         tool_registry: ToolRegistry,
         retry_budget: RetryBudget | None = None,
         metrics: RuntimeMetrics | None = None,
+        stream_event_retention_seconds: int = 86400,
         worker_instance_id: str | None = None,
         input_guardrails: tuple[InputGuardrail, ...] | None = None,
         output_guardrails: tuple[OutputGuardrail, ...] | None = None,
@@ -93,6 +96,7 @@ class SupervisorAgent:
         self.tool_registry = tool_registry
         self.retry_budget = retry_budget or RetryBudget()
         self.metrics = metrics or RuntimeMetrics()
+        self.stream_event_retention_seconds = stream_event_retention_seconds
         self.worker_instance_id = worker_instance_id or str(uuid4())
         self.input_guardrails = input_guardrails or (NonEmptyInputGuardrail(),)
         self.output_guardrails = output_guardrails or (NonEmptyOutputGuardrail(),)
@@ -113,6 +117,10 @@ class SupervisorAgent:
         await self.session_store.initialize()
         interrupted = await self.session_store.reconcile_orphaned_runs(
             self.worker_instance_id
+        )
+        await self.session_store.prune_stream_events(
+            before=datetime.now(UTC)
+            - timedelta(seconds=self.stream_event_retention_seconds)
         )
         self._accepting = True
         return interrupted
@@ -313,7 +321,7 @@ class SupervisorAgent:
         """Validate, reserve persistent ownership, and schedule provider work."""
 
         if not self._accepting:
-            raise RunError("The runtime is shutting down and is not accepting new runs.")
+            raise RuntimeUnavailableError()
         content = message.strip()
         safe_metadata = metadata or {}
         provisional = AgentContext(

@@ -97,6 +97,7 @@ def build_container(
             max_delay=settings.retry_max_delay_seconds,
             jitter=settings.retry_jitter,
         ),
+        stream_event_retention_seconds=settings.stream_event_retention_seconds,
     )
     return ApplicationContainer(
         settings=settings,

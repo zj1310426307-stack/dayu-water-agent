@@ -172,6 +172,37 @@ async def test_postgres_serializes_parallel_same_session_reservations(
     await postgres_store.fail_run(reservations[0].run.id, error_code="TEST_CLEANUP")
 
 
+async def test_postgres_parallel_same_key_resolves_to_one_owned_run(
+    postgres_store: SQLAlchemyRuntimeStore,
+) -> None:
+    """A lock waiter rechecks idempotency and replays instead of reporting busy."""
+
+    session = await postgres_store.create_session()
+    key = f"parallel-idempotency-{uuid4()}"
+
+    async def reserve(request_id: str) -> RunReservation:
+        """Race one reservation with identical durable request semantics."""
+
+        return await postgres_store.reserve_run(
+            session_id=session.id,
+            session_metadata={},
+            user_id=None,
+            idempotency_key=key,
+            request_hash="same-hash",
+            request_id=request_id,
+            trace_id=str(uuid4()),
+            provider="fake",
+            model="fake-model",
+            worker_instance_id="integration-worker",
+            run_metadata={},
+        )
+
+    first, second = await asyncio.gather(reserve(str(uuid4())), reserve(str(uuid4())))
+    assert first.run.id == second.run.id
+    assert sorted([first.owns_execution, second.owns_execution]) == [False, True]
+    await postgres_store.fail_run(first.run.id, error_code="TEST_CLEANUP")
+
+
 async def test_postgres_failure_does_not_pollute_committed_history(
     postgres_store: SQLAlchemyRuntimeStore,
 ) -> None:

@@ -251,6 +251,12 @@ class SQLAlchemyRuntimeStore(RuntimeStore):
                 else:
                     await self._locked_session(db_session, resolved_session_id)
 
+                existing = await self._idempotent_run(
+                    db_session, idempotency_key, lock=True
+                )
+                if existing is not None:
+                    return self._idempotent_reservation(existing, request_hash)
+
                 active = await self._active_run(db_session, resolved_session_id)
                 if active is not None:
                     raise SessionBusyError(
