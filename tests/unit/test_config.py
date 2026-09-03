@@ -1,9 +1,21 @@
 """Configuration validation and override tests."""
 
+import os
+
 import pytest
 from pydantic import ValidationError
 
 from dayu_agent.config import Settings
+
+
+@pytest.mark.parametrize(
+    "variable",
+    ("DATABASE_URL", "MODEL_PROVIDER", "SESSION_STORE", "OPENAI_API_KEY"),
+)
+def test_settings_tests_clear_ambient_runtime_configuration(variable: str) -> None:
+    """The autouse fixture must remove host configuration before each test."""
+
+    assert variable not in os.environ
 
 
 def test_fake_provider_requires_no_secret() -> None:
