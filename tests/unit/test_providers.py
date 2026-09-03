@@ -63,6 +63,7 @@ async def test_openai_provider_uses_agents_runner_and_normalizes_result(
         timeout_seconds=1,
         sdk_tracing_enabled=False,
     )
+    assert provider._client.max_retries == 0
     assert (await provider.health()).provider == "openai"
     response = await provider.run(provider_request())
     assert response.content == "sdk answer"

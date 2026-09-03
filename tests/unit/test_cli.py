@@ -22,7 +22,7 @@ def test_version_command(capsys: pytest.CaptureFixture[str]) -> None:
     """Version output must be stable and human-readable."""
 
     assert main(["version"]) == 0
-    assert capsys.readouterr().out.strip() == "dayu-water-agent 0.1.0"
+    assert capsys.readouterr().out.strip() == "dayu-water-agent 0.2.0"
 
 
 def test_health_command(

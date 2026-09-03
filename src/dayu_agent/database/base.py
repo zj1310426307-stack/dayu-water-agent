@@ -1,7 +1,7 @@
-"""SQLAlchemy declarative base isolated from the Agent Runtime."""
+"""SQLAlchemy declarative metadata shared by persistent runtime models."""
 
 from sqlalchemy.orm import DeclarativeBase
 
 
 class Base(DeclarativeBase):
-    """Base metadata for future persistent SessionStore implementations."""
+    """Base metadata for the PostgreSQL-backed runtime store."""

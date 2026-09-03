@@ -52,6 +52,8 @@ class AgentResult(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     request_id: str
+    run_id: str | None = None
+    trace_id: str | None = None
     session_id: str
     agent: str
     content: str

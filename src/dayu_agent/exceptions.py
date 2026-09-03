@@ -41,6 +41,58 @@ class ProviderError(DayuAgentError):
     http_status = 502
     default_message = "The model provider could not complete the request."
 
+    def __init__(
+        self,
+        message: str | None = None,
+        *,
+        details: Mapping[str, Any] | None = None,
+        retryable: bool = False,
+    ) -> None:
+        """Record stable retry classification without exposing a raw SDK exception."""
+
+        super().__init__(message, details=details)
+        self.retryable = retryable
+
+
+class ProviderUnavailableError(ProviderError):
+    """Raised for a transient provider or transport failure."""
+
+    error_code = "PROVIDER_UNAVAILABLE"
+    http_status = 503
+    default_message = "The model provider is temporarily unavailable."
+
+    def __init__(
+        self,
+        message: str | None = None,
+        *,
+        details: Mapping[str, Any] | None = None,
+    ) -> None:
+        super().__init__(message, details=details, retryable=True)
+
+
+class ProviderTimeoutError(ProviderError):
+    """Raised when one provider attempt exceeds its bounded timeout."""
+
+    error_code = "PROVIDER_TIMEOUT"
+    http_status = 504
+    default_message = "The model provider attempt timed out."
+
+    def __init__(
+        self,
+        message: str | None = None,
+        *,
+        details: Mapping[str, Any] | None = None,
+    ) -> None:
+        super().__init__(message, details=details, retryable=True)
+
+
+class RetryBudgetExhaustedError(ProviderError):
+    """Raised when retry attempt or elapsed-time limits stop execution."""
+
+    error_code = "RETRY_BUDGET_EXHAUSTED"
+    http_status = 503
+    default_message = "The provider retry budget was exhausted."
+
 
 class ToolError(DayuAgentError):
     """Base error for controlled Tool Runtime failures."""
@@ -104,6 +156,86 @@ class SessionNotFoundError(SessionError):
     error_code = "SESSION_NOT_FOUND"
     http_status = 404
     default_message = "The requested session does not exist."
+
+
+class SessionBusyError(SessionError):
+    """Raised when a session already owns an active run."""
+
+    error_code = "SESSION_BUSY"
+    http_status = 409
+    default_message = "The session already has an active run."
+
+
+class RunError(DayuAgentError):
+    """Base error for persistent AgentRun lifecycle failures."""
+
+    error_code = "RUN_ERROR"
+    http_status = 500
+    default_message = "The agent run operation failed."
+
+
+class RunNotFoundError(RunError):
+    """Raised when a run identifier does not exist."""
+
+    error_code = "RUN_NOT_FOUND"
+    http_status = 404
+    default_message = "The requested agent run does not exist."
+
+
+class InvalidRunTransitionError(RunError):
+    """Raised when code attempts an illegal state-machine transition."""
+
+    error_code = "INVALID_RUN_TRANSITION"
+    http_status = 409
+    default_message = "The requested agent run transition is not allowed."
+
+
+class IdempotencyConflictError(RunError):
+    """Raised when one idempotency key is reused with a different payload."""
+
+    error_code = "IDEMPOTENCY_CONFLICT"
+    http_status = 409
+    default_message = "The idempotency key is already bound to a different request."
+
+
+class RunCancelledError(RunError):
+    """Raised when a caller waits for a run that was cancelled."""
+
+    error_code = "RUN_CANCELLED"
+    http_status = 409
+    default_message = "The agent run was cancelled."
+
+
+class RunInterruptedError(RunError):
+    """Raised when a caller waits for a run interrupted by process loss."""
+
+    error_code = "RUN_INTERRUPTED"
+    http_status = 409
+    default_message = "The agent run was interrupted and was not replayed automatically."
+
+
+class CancellationUnavailableError(RunError):
+    """Raised when this process cannot cancel a run owned by another live worker."""
+
+    error_code = "CANCELLATION_UNAVAILABLE"
+    http_status = 409
+    default_message = "This process does not own the active provider task."
+
+
+class RuntimeUnavailableError(RunError):
+    """Raised when shutdown admission control rejects new execution ownership."""
+
+    error_code = "RUNTIME_UNAVAILABLE"
+    http_status = 503
+    default_message = "The agent runtime is not accepting new runs."
+
+
+class DatabaseUnavailableError(DayuAgentError):
+    """Raised when the selected persistent store cannot safely serve requests."""
+
+    error_code = "DATABASE_UNAVAILABLE"
+    http_status = 503
+    default_message = "The configured runtime database is unavailable."
 
 
 class GuardrailError(DayuAgentError):

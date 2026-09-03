@@ -103,9 +103,7 @@ async def test_provider_failure_propagates_as_safe_domain_error() -> None:
     with pytest.raises(ProviderError) as error:
         await supervisor.run("fail safely", session_id=session.id)
     assert "provider" in str(error.value.details)
-    messages = await store.list_messages(session.id)
-    assert len(messages) == 1
-    assert messages[0].role is MessageRole.USER
+    assert await store.list_messages(session.id) == ()
 
 
 @pytest.mark.asyncio
@@ -122,7 +120,7 @@ async def test_empty_provider_output_is_blocked() -> None:
     session = await supervisor.create_session()
     with pytest.raises(GuardrailError, match="output"):
         await supervisor.run("question", session_id=session.id)
-    assert len(await store.list_messages(session.id)) == 1
+    assert await store.list_messages(session.id) == ()
 
 
 @pytest.mark.asyncio
