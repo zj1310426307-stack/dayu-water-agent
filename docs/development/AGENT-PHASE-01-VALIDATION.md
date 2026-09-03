@@ -1,10 +1,10 @@
 # AGENT-PHASE-01 Validation
 
-- Validation date: 2026-09-02 (Asia/Shanghai)
+- Validation date: 2026-09-03 (Asia/Shanghai)
 - Repository: `dayu-water-agent`
 - Branch: `phase/agent-phase-01-runtime`
 - Baseline: `57f402b0bd8d24175767b1ca97f2a66e4a5634f3`
-- Validated implementation: `ee17324a74b5074b1e4c482182a1eff12b06b1d2`
+- Validated RC1 implementation: `cfaaa9e06bdb0785cbdbb7c39f23a578ef0ba350`
 - Result: PASS
 
 ## Environment
@@ -34,7 +34,7 @@ PostgreSQL validation used disposable Docker state, never a production database.
 | Lint | `python -m ruff check .` | PASS, exit 0 |
 | Types | `python -m mypy src/dayu_agent` | PASS, 46 source files, exit 0 |
 | OpenAPI sync | `python scripts/generate_openapi.py --check` | PASS, exit 0 |
-| Full test/coverage | `python -m pytest --cov=dayu_agent --cov-report=term-missing --cov-fail-under=80` | 74 passed, 1 skipped, 86.34%, exit 0 |
+| Full test/coverage | `python -m pytest --cov=dayu_agent --cov-report=term-missing --cov-fail-under=80` | Windows/PostgreSQL: 78 passed, 1 skipped, 86.47%, exit 0; Hosted Linux: 78 passed, 1 skipped, 86.59%, exit 0 |
 | Dependencies | `python -m pip check` | No broken requirements, exit 0 |
 | Compilation | `python -m compileall -q src tests` | PASS, exit 0 |
 | Migration up | `python -m alembic upgrade head` | PASS on real PostgreSQL |
@@ -47,11 +47,48 @@ PostgreSQL validation used disposable Docker state, never a production database.
 The skipped test is `tests/integration/test_openai_live.py`; it requires explicit
 `RUN_OPENAI_INTEGRATION=1` plus a real API key and is not a core Phase-01 gate.
 
+## GitHub Hosted CI
+
+### First hosted run: FAIL
+
+- Run: [`33701653916`](https://github.com/zj1310426307-stack/dayu-water-agent/actions/runs/33701653916)
+- Commit: `d0101cf855c6ea7d2ff0ab37781a08e9aa83c81a`
+- Job: `quality` (`100482035340`)
+- Result: 1 failed, 73 passed, 1 skipped; the failing test was
+  `tests/unit/test_config.py::test_production_requires_explicit_postgres_store_and_url`.
+
+Root cause: job-level `DATABASE_URL` was visible to every `BaseSettings` construction. The unit
+test disabled dotenv with `_env_file=None` but did not remove process environment variables, so
+the runner supplied a valid PostgreSQL URL and the expected `ValidationError` was not raised.
+
+### Fix and hermeticity regression
+
+- Every test now runs behind an autouse `isolated_settings_env` fixture that removes all runtime
+  setting aliases, including `DATABASE_URL`, `MODEL_PROVIDER`, `SESSION_STORE`, `OPENAI_API_KEY`,
+  and `OTEL_*`, before constructing `Settings`.
+- `DATABASE_URL` is no longer job-level; it exists only on the Alembic migration step.
+- `DAYU_TEST_DATABASE_URL` remains job-level for the real PostgreSQL integration suite.
+- A dedicated CI step deliberately supplies the four contaminating variables and runs all config
+  tests; the fixture contract fails closed if isolation is removed.
+- Workflow token permissions are restricted to `contents: read`.
+- Official stable `actions/checkout@v7` and `actions/setup-python@v7` replace the older Node
+  runtimes. No insecure-runtime override is used.
+
+### Final hosted run: PASS
+
+- Run: [`33704659182`](https://github.com/zj1310426307-stack/dayu-water-agent/actions/runs/33704659182)
+- Commit: `cfaaa9e06bdb0785cbdbb7c39f23a578ef0ba350`
+- Runner: GitHub-hosted Ubuntu 24.04, runner `2.337.0`, Python 3.12.14
+- Job: `quality` (`100491114735`), conclusion `success`
+- Migrations, polluted-environment regression, Ruff, strict mypy, OpenAPI sync, full pytest,
+  coverage, pip check, and compileall all completed successfully.
+- Hosted result: 78 passed, 1 opt-in test skipped, coverage 86.59%.
+
 ## Gate A–N evidence
 
 | Gate | Evidence | Status |
 |---|---|---|
-| A Phase-00 regression | Original 43 behaviors retained in the expanded 74-pass suite; security tests remain | PASS |
+| A Phase-00 regression | Original 43 behaviors retained in the expanded 78-pass suite; security tests remain | PASS |
 | B persistent session | Real PostgreSQL API instance restarted; session retained two committed messages and its completed run | PASS |
 | C idempotency | Concurrent same-key tests return one run; Fake provider call count is one; PostgreSQL lock-wait race covered | PASS |
 | D conflict | Same key with changed payload returns `IDEMPOTENCY_CONFLICT`, HTTP 409 | PASS |
@@ -63,7 +100,7 @@ The skipped test is `tests/integration/test_openai_live.py`; it requires explici
 | J observability | Test captures request, run, session, and trace IDs; attempt/retry logs, metrics, and optional OTEL contracts covered | PASS |
 | K database failure | Explicit PostgreSQL store with unavailable database returns `/ready` 503 and chat `DATABASE_UNAVAILABLE` 503; no fallback | PASS |
 | L Docker | Build, migration, up, health, ready, non-root UID, real SSE, API restart, and persistent recovery passed | PASS |
-| M quality | Ruff, mypy, pytest, 86.34% coverage, pip check, compileall, and OpenAPI sync passed | PASS |
+| M quality | Ruff, mypy, pytest, Windows 86.47% / Hosted Linux 86.59% coverage, pip check, compileall, OpenAPI sync, and Hosted CI passed | PASS |
 | N security | No Tiangong import, dangerous execution tools, or real secrets; static scan and boundary tests passed | PASS |
 
 ## API smoke
